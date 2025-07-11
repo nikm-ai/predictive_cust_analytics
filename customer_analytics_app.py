@@ -18,7 +18,7 @@ This dashboard simulates how a payment platform (like Stripe) analyzes merchant 
 - Predict **churn risk** for proactive retention  
 - Predict **monthly revenue** to guide financial planning
 
-This version adds **powerful churn features** & **auto imbalance tuning** for XGBoost.
+This sexy version adds **powerful churn features** & **auto imbalance tuning** for XGBoost.
 """)
 
 # --- SYNTHETIC DATA ---
