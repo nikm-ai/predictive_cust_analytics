@@ -2,12 +2,15 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 import plotly.express as px
-from sklearn.model_selection import train_test_split
+from sklearn.model_selection import train_test_split, RandomizedSearchCV
 from sklearn.metrics import (precision_score, recall_score, f1_score,
                              roc_curve, auc, confusion_matrix, mean_squared_error, r2_score)
 from sklearn.linear_model import LinearRegression
 from sklearn.preprocessing import OneHotEncoder
-from xgboost import XGBClassifier  # XGBoost for churn
+from xgboost import XGBClassifier
+import shap
+import matplotlib.pyplot as plt
+import seaborn as sns
 
 # --- PAGE CONFIG ---
 st.set_page_config(page_title="SaaS Customer Churn & Revenue Prediction", layout="wide")
@@ -18,7 +21,7 @@ This dashboard simulates how a payment platform might analyze merchant customers
 - Predict **churn risk** for proactive retention  
 - Predict **monthly revenue** to guide financial planning
 
-This version adds **powerful churn features** & **auto imbalance tuning** for XGBoost.
+This version adds **powerful churn features, auto imbalance tuning, hyperparameter tuning, and SHAP explanations**.
 """)
 
 # --- SYNTHETIC DATA ---
@@ -59,17 +62,32 @@ df = df.dropna()
 def feature_engineering(df):
     df = df.copy()
 
-    # Original feature: engagement_score
+    # Original feature
     df["engagement_score"] = df["monthly_txn_volume"] * (df["subscription_age_days"] / 365)
 
-    # New churn feature: txn_volume_change
+    # New churn features:
     avg_txn = df["monthly_txn_volume"].mean()
     df["txn_volume_change"] = (df["monthly_txn_volume"] - avg_txn) / avg_txn
-
-    # New churn feature: days_since_last_txn (simulate recency)
     df["days_since_last_txn"] = np.random.randint(1, 60, len(df))
 
-    # One-hot encode payment_method
+    # 5 additional industry-standard churn features:
+    # 1. avg_txn_value_change: simulate change in avg txn value
+    df["avg_txn_value_change"] = (df["avg_txn_value"] - df["avg_txn_value"].mean()) / df["avg_txn_value"].mean()
+
+    # 2. high_support_flag: binary flag for many support tickets (e.g. >3)
+    df["high_support_flag"] = (df["support_tickets"] > 3).astype(int)
+
+    # 3. low_volume_flag: binary flag for low monthly transaction volume (< 30)
+    df["low_volume_flag"] = (df["monthly_txn_volume"] < 30).astype(int)
+
+    # 4. recent_subscription_flag: new customers < 90 days
+    df["recent_subscription_flag"] = (df["subscription_age_days"] < 90).astype(int)
+
+    # 5. payment_method_risk: assign risk score to payment method (example)
+    risk_map = {"Credit Card": 1, "ACH": 2, "Wire Transfer": 3, "Paypal": 4}
+    df["payment_method_risk"] = df["payment_method"].map(risk_map)
+
+    # One-hot encode payment_method (still useful)
     encoder = OneHotEncoder(drop='first', sparse_output=False)
     payment_ohe = encoder.fit_transform(df[["payment_method"]])
     payment_df = pd.DataFrame(payment_ohe, columns=[f"pay_{cat}" for cat in encoder.categories_[0][1:]])
@@ -90,7 +108,12 @@ base_features = [
     "support_tickets",
     "engagement_score",
     "txn_volume_change",
-    "days_since_last_txn"
+    "days_since_last_txn",
+    "avg_txn_value_change",
+    "high_support_flag",
+    "low_volume_flag",
+    "recent_subscription_flag",
+    "payment_method_risk"
 ] + payment_ohe_cols
 
 selected_features = st.sidebar.multiselect("Features", base_features, default=base_features)
@@ -130,16 +153,25 @@ else:
     X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
 
     if task == "Churn Classification":
-        # ✅ Dynamically calculate scale_pos_weight
+        # Calculate scale_pos_weight for imbalance
         neg, pos = np.bincount(y_train)
         spw = neg / pos
 
-        model = XGBClassifier(
-            use_label_encoder=False,
-            eval_metric='logloss',
-            scale_pos_weight=spw
-        )
-        model.fit(X_train, y_train)
+        # Hyperparameter tuning with RandomizedSearchCV
+        param_dist = {
+            'n_estimators': [50, 100, 200],
+            'max_depth': [3, 5, 7, 10],
+            'learning_rate': [0.01, 0.05, 0.1, 0.2],
+            'subsample': [0.6, 0.8, 1.0],
+            'colsample_bytree': [0.6, 0.8, 1.0],
+            'scale_pos_weight': [spw]  # keep imbalance tuned
+        }
+        base_model = XGBClassifier(use_label_encoder=False, eval_metric='logloss')
+        search = RandomizedSearchCV(base_model, param_distributions=param_dist,
+                                    n_iter=20, scoring='f1', cv=3, random_state=42, n_jobs=-1)
+        search.fit(X_train, y_train)
+        model = search.best_estimator_
+
         y_prob = model.predict_proba(X_test)[:, 1]
         y_pred_adjusted = (y_prob >= threshold).astype(int)
 
@@ -152,7 +184,6 @@ else:
         st.metric("Precision", f"{prec:.2%}")
         st.metric("Recall", f"{rec:.2%}")
         st.metric("F1 Score", f"{f1:.2%}")
-
         st.markdown(f"**Decision Threshold:** `{threshold}` — lower it to increase recall, higher it to increase precision.")
 
         cm = confusion_matrix(y_test, y_pred_adjusted)
@@ -167,6 +198,7 @@ else:
         fig_roc.add_shape(type='line', line=dict(dash='dash'), x0=0, y0=0, x1=1, y1=1)
         st.plotly_chart(fig_roc)
 
+        # Feature importance (gain)
         importance = model.feature_importances_
         coef_df = pd.DataFrame({
             "Feature": selected_features,
@@ -174,13 +206,23 @@ else:
         }).sort_values(by="Importance", ascending=False)
         st.dataframe(coef_df)
 
+        # --- SHAP explanations ---
+        st.subheader("4️⃣ SHAP Feature Interpretability")
+        explainer = shap.TreeExplainer(model)
+        shap_values = explainer.shap_values(X_test)
+
+        # Summary plot (force matplotlib figure to show)
+        fig_shap, ax = plt.subplots(figsize=(10, 6))
+        shap.summary_plot(shap_values, X_test, plot_type="bar", show=False)
+        st.pyplot(fig_shap)
+
         st.markdown("""
-        ✅ **Interpretation:**  
-        - **Higher importance** means bigger impact on churn prediction  
-        - Unlike coefficients, this is not signed: direction needs SHAP or partial dependence plots
+        SHAP values explain the impact of each feature on the model's predictions.  
+        Higher SHAP value means a feature pushes prediction towards churn, lower means reduces churn risk.
         """)
 
     else:
+        # Revenue Regression (no tuning here, but can be added similarly)
         model = LinearRegression()
         model.fit(X_train, y_train)
         y_pred = model.predict(X_test)
@@ -209,4 +251,3 @@ else:
         - **Negative coefficients** decrease revenue  
         - Look for biggest drivers to inform strategy.
         """)
-
