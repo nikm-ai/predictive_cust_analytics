@@ -2,11 +2,12 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 import plotly.express as px
-from sklearn.linear_model import LogisticRegression, LinearRegression
 from sklearn.model_selection import train_test_split
-from sklearn.metrics import (classification_report, mean_squared_error, precision_score,
-                             recall_score, f1_score, r2_score, roc_curve, auc, confusion_matrix)
+from sklearn.metrics import (precision_score, recall_score, f1_score,
+                             roc_curve, auc, confusion_matrix, mean_squared_error, r2_score)
+from sklearn.linear_model import LinearRegression
 from sklearn.preprocessing import OneHotEncoder
+from xgboost import XGBClassifier  # NEW: using XGBoost
 
 # --- PAGE CONFIG ---
 st.set_page_config(page_title="SaaS Customer Churn & Revenue Prediction", layout="wide")
@@ -17,7 +18,7 @@ This dashboard simulates how a payment platform (like Stripe) analyzes merchant 
 - Predict **churn risk** for proactive retention  
 - Predict **monthly revenue** to guide financial planning
 
-This version fixes class imbalance issues & lets you tune your decision threshold to see real tradeoffs.
+This version uses **XGBoost** for better churn detection.
 """)
 
 # --- SYNTHETIC DATA ---
@@ -116,12 +117,13 @@ else:
     X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
 
     if task == "Churn Classification":
-        model = LogisticRegression(max_iter=1000)
+        # ✅ Use XGBoost for churn classification
+        model = XGBClassifier(use_label_encoder=False, eval_metric='logloss', scale_pos_weight=1)
         model.fit(X_train, y_train)
         y_prob = model.predict_proba(X_test)[:, 1]
         y_pred_adjusted = (y_prob >= threshold).astype(int)
 
-        acc = model.score(X_test, y_test)
+        acc = (y_pred_adjusted == y_test).mean()
         prec = precision_score(y_test, y_pred_adjusted, zero_division=0)
         rec = recall_score(y_test, y_pred_adjusted, zero_division=0)
         f1 = f1_score(y_test, y_pred_adjusted, zero_division=0)
@@ -145,17 +147,18 @@ else:
         fig_roc.add_shape(type='line', line=dict(dash='dash'), x0=0, y0=0, x1=1, y1=1)
         st.plotly_chart(fig_roc)
 
+        # Feature importance for trees
+        importance = model.feature_importances_
         coef_df = pd.DataFrame({
             "Feature": selected_features,
-            "Coefficient": model.coef_[0]
-        }).sort_values(by="Coefficient", key=abs, ascending=False)
+            "Importance": importance
+        }).sort_values(by="Importance", ascending=False)
         st.dataframe(coef_df)
 
         st.markdown("""
         ✅ **Interpretation:**  
-        - **Positive coefficients** increase churn risk  
-        - **Negative coefficients** reduce churn risk  
-        - **Adjust threshold** to trade precision vs recall
+        - **Higher importance** means bigger impact on churn prediction  
+        - Unlike coefficients, this is not signed: direction needs SHAP or partial dependence plots
         """)
 
     else:
@@ -188,60 +191,3 @@ else:
         - Look for biggest drivers to inform strategy.
         """)
 
-st.markdown("### 🔍 Feature-by-Feature Interpretation")
-
-# Create a list of (feature, coef, abs(coef))
-coef_info = [(feat, coef, abs(coef)) for feat, coef in zip(selected_features, model.coef_[0])]
-
-# Sort by absolute value, descending
-coef_info.sort(key=lambda x: x[2], reverse=True)
-
-feature_explanations = []
-
-# Adjust these thresholds as needed for your scale:
-tiny_threshold = 0.01
-moderate_threshold = 0.05
-
-for feat, coef, abs_coef in coef_info:
-    # Plain-English meaning
-    if feat == "subscription_age_days":
-        meaning = "the number of days the merchant has been subscribed"
-    elif feat == "monthly_txn_volume":
-        meaning = "the number of transactions processed per month"
-    elif feat == "avg_txn_value":
-        meaning = "the average value of each transaction"
-    elif feat == "support_tickets":
-        meaning = "the number of support tickets opened"
-    elif feat == "engagement_score":
-        meaning = "a composite score: transaction volume weighted by subscription age"
-    elif feat.startswith("pay_"):
-        payment_type = feat.replace("pay_", "")
-        meaning = f"whether the merchant primarily uses {payment_type} as their payment method"
-    else:
-        meaning = "a custom feature"
-
-    # Sign-based impact direction
-    if coef > 0:
-        direction = "increases churn risk"
-    elif coef < 0:
-        direction = "reduces churn risk"
-    else:
-        direction = "has no impact on churn risk"
-
-    # Magnitude-based nuance
-    if abs_coef < tiny_threshold:
-        magnitude = "has **no meaningful impact**"
-    elif abs_coef < moderate_threshold:
-        magnitude = f"has a **small but noticeable effect** and generally {direction}"
-    else:
-        magnitude = f"has a **strong impact** and clearly {direction}"
-
-    feature_explanations.append(
-        f"- **{feat}** represents *{meaning}*. Its coefficient is `{coef:.3f}`, so it {magnitude}."
-    )
-
-st.markdown("\n".join(feature_explanations))
-
-
-st.markdown("---")
-st.markdown("🔍 **Balanced churn, adjustable threshold, confusion matrix — realistic and practical, just like you’d do at Stripe!**")
