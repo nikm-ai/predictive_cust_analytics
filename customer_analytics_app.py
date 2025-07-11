@@ -7,7 +7,7 @@ from sklearn.metrics import (precision_score, recall_score, f1_score,
                              roc_curve, auc, confusion_matrix, mean_squared_error, r2_score)
 from sklearn.linear_model import LinearRegression
 from sklearn.preprocessing import OneHotEncoder
-from xgboost import XGBClassifier  # NEW: using XGBoost
+from xgboost import XGBClassifier  # XGBoost for churn
 
 # --- PAGE CONFIG ---
 st.set_page_config(page_title="SaaS Customer Churn & Revenue Prediction", layout="wide")
@@ -18,7 +18,7 @@ This dashboard simulates how a payment platform (like Stripe) analyzes merchant 
 - Predict **churn risk** for proactive retention  
 - Predict **monthly revenue** to guide financial planning
 
-This version uses **XGBoost** for better churn detection.
+This version adds **powerful churn features** & **auto imbalance tuning** for XGBoost.
 """)
 
 # --- SYNTHETIC DATA ---
@@ -34,9 +34,8 @@ def load_sample_data():
         "payment_method": np.random.choice(
             ["Credit Card", "ACH", "Wire Transfer", "Paypal"], n, p=[0.6, 0.25, 0.1, 0.05]),
         "support_tickets": np.random.poisson(1.5, n),
-        "is_active": np.random.choice([0, 1], n, p=[0.4, 0.6])  # More inactive now!
+        "is_active": np.random.choice([0, 1], n, p=[0.4, 0.6])
     })
-    # More generous churn condition — boost churn % to ~30–40%
     data["churn"] = np.where(
         (data["is_active"] == 0) | ((data["support_tickets"] > 1) & (data["monthly_txn_volume"] < 35)),
         1, 0)
@@ -59,11 +58,23 @@ df = df.dropna()
 @st.cache_data
 def feature_engineering(df):
     df = df.copy()
+
+    # Original feature: engagement_score
     df["engagement_score"] = df["monthly_txn_volume"] * (df["subscription_age_days"] / 365)
+
+    # New churn feature: txn_volume_change
+    avg_txn = df["monthly_txn_volume"].mean()
+    df["txn_volume_change"] = (df["monthly_txn_volume"] - avg_txn) / avg_txn
+
+    # New churn feature: days_since_last_txn (simulate recency)
+    df["days_since_last_txn"] = np.random.randint(1, 60, len(df))
+
+    # One-hot encode payment_method
     encoder = OneHotEncoder(drop='first', sparse_output=False)
     payment_ohe = encoder.fit_transform(df[["payment_method"]])
     payment_df = pd.DataFrame(payment_ohe, columns=[f"pay_{cat}" for cat in encoder.categories_[0][1:]])
     df = pd.concat([df.reset_index(drop=True), payment_df], axis=1)
+
     return df, list(payment_df.columns)
 
 df, payment_ohe_cols = feature_engineering(df)
@@ -77,7 +88,9 @@ base_features = [
     "monthly_txn_volume",
     "avg_txn_value",
     "support_tickets",
-    "engagement_score"
+    "engagement_score",
+    "txn_volume_change",
+    "days_since_last_txn"
 ] + payment_ohe_cols
 
 selected_features = st.sidebar.multiselect("Features", base_features, default=base_features)
@@ -117,8 +130,15 @@ else:
     X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
 
     if task == "Churn Classification":
-        # ✅ Use XGBoost for churn classification
-        model = XGBClassifier(use_label_encoder=False, eval_metric='logloss', scale_pos_weight=1)
+        # ✅ Dynamically calculate scale_pos_weight
+        neg, pos = np.bincount(y_train)
+        spw = neg / pos
+
+        model = XGBClassifier(
+            use_label_encoder=False,
+            eval_metric='logloss',
+            scale_pos_weight=spw
+        )
         model.fit(X_train, y_train)
         y_prob = model.predict_proba(X_test)[:, 1]
         y_pred_adjusted = (y_prob >= threshold).astype(int)
@@ -147,7 +167,6 @@ else:
         fig_roc.add_shape(type='line', line=dict(dash='dash'), x0=0, y0=0, x1=1, y1=1)
         st.plotly_chart(fig_roc)
 
-        # Feature importance for trees
         importance = model.feature_importances_
         coef_df = pd.DataFrame({
             "Feature": selected_features,
